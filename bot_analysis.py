@@ -559,7 +559,6 @@ def process_tweets(tweets: TweetList, chunk_size: int = 1000) -> pd.DataFrame:
     return pd.DataFrame()
 
 
-# TODO: Consider using Pydantic instead of TypedDict for better verification
 def analyze_temporal_patterns(df: pd.DataFrame, burst_threshold: float = 5.0) -> TemporalAnalysisResult:
     """
     Analyze temporal patterns in tweet data with optimized Pandas operations.
