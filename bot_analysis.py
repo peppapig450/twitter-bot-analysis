@@ -5,15 +5,16 @@ import asyncio
 import json
 import logging
 import os
+import sys
+import time
+from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from itertools import islice
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
-    Annotated,
     Any,
-    AsyncGenerator,
     ClassVar,
     Literal,
     Required,
@@ -32,20 +33,17 @@ import tweepy.errors
 import zstandard as zstd
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field, ValidationError, field_validator
+from scipy.sparse import csr_matrix
 from sklearn.decomposition import TruncatedSVD
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
-from spacy.language import Language
-from spacy.util import is_package
+from tabulate import tabulate
 from tweepy.asynchronous import AsyncClient, AsyncPaginator
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 from wordcloud import WordCloud
 
 if TYPE_CHECKING:
-    from typing import Final
-
     from numpy.typing import NDArray
-    from scipy.sparse import csr_matrix
     from spacy.language import Language
 
 try:
@@ -61,6 +59,9 @@ type TweetList = list[tweepy.Tweet]
 type TweetDict = dict[int, tweepy.Tweet | None]
 type UserMap = dict[int, str]
 type AnalysisResult = dict[str, Any]
+type RateLimitEndpoint = Literal["users_tweets", "tweets"]
+
+sentiment_analyzer = SentimentIntensityAnalyzer()
 
 
 def get_bearer_token() -> str:
@@ -82,9 +83,6 @@ def get_bearer_token() -> str:
             return token
     error_message = "Bearer token not found. Set X_BEARER_TOKEN in environment or create a .env file with X_BEARER_TOKEN=your_token_here. See README for setup."
     raise ValueError(error_message)
-
-
-type RateLimitEndpoint = Literal["users_tweets", "tweets"]
 
 
 # Define the structure of rate_limits
@@ -207,11 +205,13 @@ class Paths:
         "OUTPUT_CSV": "{account}_analysis.csv",
         "TEMPORAL_PLOT": "{account}_temporal_patterns.png",
         "NETWORK_PLOT": "{account}_network_graph.png",
+        "WORDCLOUD_PLOT": "{account}_wordcloud.png",
     }
     DATA_FILE: Path = field(default_factory=lambda: Path(), init=False)
     OUTPUT_CSV: Path = field(default_factory=lambda: Path(), init=False)
     TEMPORAL_PLOT: Path = field(default_factory=lambda: Path(), init=False)
     NETWORK_PLOT: Path = field(default_factory=lambda: Path(), init=False)
+    WORDCLOUD_PLOT: Path = field(default_factory=lambda: Path(), init=False)
 
     def __post_init__(self) -> None:
         """Initialize paths dynamically based on the account name."""
@@ -227,7 +227,7 @@ class Paths:
 class RateLimiter:
     """A rate limiter for tracking and enforcing API request limits per endpoint."""
 
-    max_requests: dict[str, int]  # Maximum requests per endpoint
+    max_requests: RateLimits  # Maximum requests per endpoint
     reset_interval: int = 900  # Reset interval in seconds (default: 15 minutes)
     requests: dict[str, int] = field(default_factory=dict)  # Current request counts
     reset_times: dict[str, float] = field(default_factory=dict)  # Reset timestamps
@@ -266,7 +266,11 @@ class RateLimiter:
             logging.debug("Rate limit expired for %s resetting.", endpoint)
             self.requests[endpoint] = 0
             del self.reset_times[endpoint]
-        return self.requests.get(endpoint, 0) >= self.max_requests.get(endpoint, 0)
+
+        limit = self.max_requests.get(endpoint, 0)
+        if not isinstance(limit, int):
+            limit = 0
+        return self.requests.get(endpoint, 0) >= limit
 
     def get_remaining_time(self, endpoint: str) -> float:
         """
@@ -886,9 +890,11 @@ def analyze_content_dynamic(
             - type_token_ratio: Unique tokens / total tokens.
             - avg_sentence_length: Average sentences per text.
             - text_similarity: Mean cosine similarity between texts (0 if single text).
+             - sentiment_stats: Average sentiment scores (compound, positive, negative, neutral).
 
     Notes:
         Returns default result if input is invalid or processing fails.
+        Uses VADER for sentiment analysis, optimized for social media.
 
     """
     default_result = ContentAnalysisResult()
@@ -927,7 +933,7 @@ def analyze_content_dynamic(
         top_indices = term_scores.argsort()[::-1][:n_terms]
         top_terms = [str(feature_names[i]) for i in top_indices]
 
-        # Topic modeling
+        # Topic modeling with TruncatedSVD (LSA)
         svd = TruncatedSVD(n_components=n_components, random_state=42)
         svd.fit(tfidf_matrix)
         topics = []
@@ -973,3 +979,144 @@ def analyze_content_dynamic(
     except Exception:
         logging.exception("Content analysis failed")
         return default_result
+
+
+async def main(account: str, config: ConfigModel, log_level: str = "INFO") -> int:
+    """
+    Main execution function orchestrating Twitter data analysis with concurrent operations.
+
+    Args:
+        account: Twitter username to analyze (e.g., "example_user").
+        config: Configuration object with analysis parameters.
+        log_level: Logging level ("DEBUG", "INFO", "WARNING", "ERROR").
+
+    Returns:
+        int: Exit code (0 for success, 1 for failure).
+
+    """
+    # Configure logging with the provided level
+    setup_logging(log_level)
+    logging.info("Starting analysis for @%s with log_level %s", account, log_level)
+
+    try:
+        # Step 1: Initialize components
+        paths = Paths(account)
+        rate_limiter = RateLimiter(max_requests=config.rate_limits, reset_interval=config.reset_interval)
+
+        # Step 2: Load NLP model with fallback
+        nlp = load_nlp_model(config.nlp_model)
+        if nlp is None:
+            logging.warning("Proceeding with basic tokenization due to NLP model failure.")
+
+        # Step 3: Fetch or load tweet data
+        tweets, original_posts, user_map = load_from_json(paths.DATA_FILE)
+        if not tweets or (
+            paths.DATA_FILE.exists() and (time.time() - paths.DATA_FILE.stat().st_mtime > 3600)
+        ):
+            logging.info("Cache missing or outdated; fetching new data.")
+            bearer_token = get_bearer_token()
+            client = AsyncClient(bearer_token)
+
+            # Get user ID
+            try:
+                response = await client.get_user(username=account)
+                if not response.data:
+                    logging.error("User @%s account not found.", account)
+                    return 1
+                user_id = response.data.id
+            except tweepy.errors.TweepyException:
+                logging.exception("Failed to fetch user ID for @%s", account)
+                return 1
+
+            # Fetch tweets and original posts
+            tweets = await fetch_tweets(client, user_id, rate_limiter, config.max_tweets)
+            if not tweets:
+                logging.warning("No tweets retrieved for @%s", account)
+                return 1
+            original_posts, user_map = await fetch_original_posts(client, tweets, rate_limiter)
+            save_to_json(tweets, original_posts, user_map, paths.DATA_FILE)
+
+        # Step 4: Process tweets into DataFrame
+        df = process_tweets(tweets)
+        if df.empty:
+            logging.error("Processed tweet data is empty.")
+            return 1
+
+        # Step 5: Perform analyses
+        temporal_data = analyze_temporal_patterns(df)
+        content_data = analyze_content_dynamic(df, nlp)
+
+        # Step 6: Generate visualizations concurently
+        async with asyncio.TaskGroup() as tg:
+            _ = tg.create_task(
+                asyncio.to_thread(plot_temporal_patterns, temporal_data, paths.TEMPORAL_PLOT)
+            )
+            _ = tg.create_task(
+                asyncio.to_thread(plot_content_visualizations, content_data, paths.WORDCLOUD_PLOT)
+            )
+
+        # Step 7: Save analysis results
+        temporal_scalars = {
+            "avg_time_between": temporal_data.avg_time_between,
+            "std_time_between": temporal_data.std_time_between,
+            "cv_time_between": temporal_data.cv_time_between,
+            "num_bursts": temporal_data.num_bursts,
+            "avg_burst_size": temporal_data.avg_burst_size,
+        }
+        content_scalars = {
+            "type_token_ratio": content_data.type_token_ratio,
+            "avg_sentence_length": content_data.avg_sentence_length,
+            "text_similarity": content_data.text_similarity,
+        }
+        results_df = pd.DataFrame(
+            {
+                "metric": list(temporal_scalars.keys()) + list(content_scalars.keys()),
+                "value": list(temporal_scalars.values()) + list(content_scalars.values()),
+            }
+        )
+        results_df.to_csv(paths.OUTPUT_CSV, index=False)
+        logging.info("Results saved to %s", str(Paths.OUTPUT_CSV))
+
+        # Step 8: Log summary
+        summary_table = tabulate(
+            results_df[["metric", "value"]].values, headers=["Metric", "Value"], tablefmt="pretty"
+        )
+        logging.info(f"Analysis Summary:\n{summary_table}")
+
+        logging.info("Analysis completed successfully for @%s", account)
+
+    except* Exception as errors:
+        for error in errors.exceptions:
+            logging.exception("Unhandled exception occurred", exc_info=error)
+    else:
+        return 0
+
+    return 1
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Analyze Twitter account activity.")
+    parser.add_argument("account", type=str, help="Twitter account username")
+    parser.add_argument("--config", "-c", type=str, help="Path to configuration file")
+    parser.add_argument(
+        "--log-level",
+        type=str,
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="Set the logging level (default: INFO)",
+    )
+    args = parser.parse_args()
+
+    config_path = Path(args.config) if args.config else None
+    config = load_config(config_path)
+
+    # Run the main function with the parsed log level
+    try:
+        exit_code = asyncio.run(main(args.account, config, args.log_level))
+        sys.exit(exit_code)
+    except KeyboardInterrupt:
+        logging.info("Analysis interrupted by user.")
+        sys.exit(130)
+    except Exception:
+        logging.exception("Fatal error")
+        sys.exit(1)
