@@ -1,0 +1,9 @@
+{
+    "max_tweets": 1000,
+    "rate_limits": {
+        "users_tweets": 1500,
+        "tweets": 900
+    },
+    "reset_interval": 900,
+    "nlp_model": "en_core_web_sm"
+}
