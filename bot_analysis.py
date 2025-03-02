@@ -134,6 +134,9 @@ class ContentAnalysisResult(BaseModel):
     type_token_ratio: float = 0.0
     avg_sentence_length: float = 0.0
     text_similarity: float = 0.0
+    sentiment_stats: dict[str, float] = Field(
+        default_factory=lambda: {"compound": 0.0, "positive": 0.0, "negative": 0.0, "neutral": 0.0}
+    )
 
     model_config = {
         "arbitrary_types_allowed": True,
@@ -968,12 +971,30 @@ def analyze_content_dynamic(
         else:
             text_similarity = 0.0
 
+        # Sentiment analysis with VADER
+        sentiment_scores = []
+        for text in texts:
+            if isinstance(text, str) and text.strip():
+                scores = sentiment_analyzer.polarity_scores(text)
+                sentiment_scores.append(scores)
+
+        if sentiment_scores:
+            avg_sentiment = {
+                "compound": float(np.mean([s["compound"] for s in sentiment_scores])),
+                "positive": float(np.mean([s["pos"] for s in sentiment_scores])),
+                "negative": float(np.mean([s["neg"] for s in sentiment_scores])),
+                "neutral": float(np.mean([s["neu"] for s in sentiment_scores])),
+            }
+        else:
+            avg_sentiment = {"compound": 0.0, "positive": 0.0, "negative": 0.0, "neutral": 0.0}
+
         return ContentAnalysisResult(
             top_terms=top_terms,
             topics=topics,
             type_token_ratio=type_token_ratio,
             avg_sentence_length=avg_sentence_length,
             text_similarity=text_similarity,
+            sentiment_stats=avg_sentiment,
         )
 
     except Exception:
@@ -1067,6 +1088,10 @@ async def main(account: str, config: ConfigModel, log_level: str = "INFO") -> in
             "type_token_ratio": content_data.type_token_ratio,
             "avg_sentence_length": content_data.avg_sentence_length,
             "text_similarity": content_data.text_similarity,
+            "sentiment_compound": content_data.sentiment_stats["compound"],
+            "sentiment_positive": content_data.sentiment_stats["positive"],
+            "sentiment_negative": content_data.sentiment_stats["negative"],
+            "sentiment_neutral": content_data.sentiment_stats["neutral"],
         }
         results_df = pd.DataFrame(
             {
