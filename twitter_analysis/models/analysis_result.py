@@ -1,5 +1,5 @@
 import pandas as pd
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class TemporalAnalysisResult(BaseModel):
@@ -22,9 +22,9 @@ class TemporalAnalysisResult(BaseModel):
             raise ValueError(error_message)
         return v
 
-    model_config = {
-        "arbitrary_types_allowed": True,
-    }
+    model_config = ConfigDict(
+        arbitrary_types_allowed=True
+    )
 
 
 class ContentAnalysisResult(BaseModel):
@@ -39,6 +39,6 @@ class ContentAnalysisResult(BaseModel):
         default_factory=lambda: {"compound": 0.0, "positive": 0.0, "negative": 0.0, "neutral": 0.0}
     )
 
-    model_config = {
-        "arbitrary_types_allowed": True,
-    }
+    model_config = ConfigDict(
+        arbitrary_types_allowed=True
+    )
