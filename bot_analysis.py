@@ -22,9 +22,7 @@ from typing import (
     cast,
 )
 
-import matplotlib.pyplot as plt
 import pandas as pd
-import seaborn as sns
 import spacy
 import spacy.cli
 import tweepy
@@ -35,9 +33,10 @@ from pydantic import BaseModel, Field, ValidationError, field_validator
 from tabulate import tabulate
 from tweepy.asynchronous import AsyncClient, AsyncPaginator
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
-from wordcloud import WordCloud
 
 from twitter_analysis.analysis.content import analyze_content_dynamic
+from twitter_analysis.visualization.content_plots import plot_content_visualizations
+from twitter_analysis.visualization.temporal_plots import plot_temporal_patterns
 
 if TYPE_CHECKING:
     from spacy.language import Language
@@ -666,166 +665,6 @@ def analyze_temporal_patterns(df: pd.DataFrame, burst_threshold: float = 5.0) ->
     except Exception:
         logging.exception("Error during temporal analysis.")
         return TemporalAnalysisResult()
-
-
-def plot_temporal_patterns(
-    temporal_data: TemporalAnalysisResult,
-    path: Path,
-    style: str = "seaborn-v0_8",
-    dpi: int = 300,
-) -> bool:
-    """
-    Plot temporal patterns with optimized plotting and robust error handling.
-
-    Args:
-        temporal_data: TemporalAnalysisResult object with temporal statistics.
-        path: Path to save the plot.
-        style: Matplotlib style context (default: "seaborn-v0_8").
-        dpi: Resolution for saving the plot (default: 300).
-
-    Returns:
-        bool: True if plot saved successfully, False otherwise.
-
-    """
-    # Validate inputs via pydantic
-    hour_counts = temporal_data.hour_counts
-    day_counts = temporal_data.day_counts
-
-    if hour_counts.empty and day_counts.empty:
-        logging.warning("No temporal data to plot (both hour_counts and day_counts are empty).")
-        return False
-
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-
-        # Static day labels
-        day_labels = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
-
-        # Create figure with style context
-        with plt.style.context(style):
-            fig, axes = plt.subplots(1, 2, figsize=(12, 6), constrained_layout=True)
-            ax1, ax2 = axes
-
-            # Plot hourly plots if data exists
-            if not hour_counts.empty:
-                sns.barplot(
-                    x=hour_counts.index,
-                    y=hour_counts.to_numpy(),
-                    ax=ax1,
-                    palette="virdis",
-                    hue=hour_counts.index,  # Avoid FutureWarning
-                    legend=False,
-                )
-                ax1.set(
-                    title="Tweets per Hour",
-                    xlabel="Hour of Day",
-                    ylabel="Number of Tweets",
-                )
-                ax1.tick_params(axis="x", rotation=45)
-                ax1.grid(True, linestyle="--", alpha="0.7")
-
-            # Plot daily counts if data exists
-            if not day_counts.empty:
-                sns.barplot(
-                    x=day_counts.index,
-                    y=day_counts.to_numpy(),
-                    ax=ax2,
-                    palette="virdis",
-                    hue=day_counts.index,  # Avoid FutureWarning
-                    legend=False,
-                )
-                ax2.set(
-                    title="Tweets per Day of Week",
-                    xlabel="Day of Week",
-                    ylabel="Number of Tweets",
-                )
-                ax2.set_xticks(range(len(day_counts)))
-                ax2.set_xticklabels([day_labels[i] for i in day_counts.index], rotation=45)
-                ax2.grid(True, linestyle="--", alpha="0.7")
-
-            # Save and close figure
-            fig.savefig(path, dpi=dpi, bbox_inches="tight")
-            plt.close(fig)
-            logging.info("Temporal patterns plot saved to %s", path)
-            return True
-    except OSError:
-        logging.exception("Failed to save plot to %s", path)
-        return False
-    except Exception:
-        logging.exception("Error plotting temporal data")
-        return False
-
-
-def plot_content_visualizations(
-    content_data: ContentAnalysisResult,
-    path: Path,
-    style: str = "seaborn-v0_8",
-    dpi: int = 300,
-    wordcloud_params: dict[str, Any] | None = None,
-) -> bool:
-    """
-    Generate and save a word cloud for top terms in content analysis.
-
-    Args:
-        content_data: ContentAnalysisResult object with top terms.
-        path: Path to save the word cloud image.
-        style: Matplotlib style context (default: "seaborn-v0_8").
-        dpi: Resolution for saving the plot (default: 300).
-        wordcloud_params: Optional dict of additional WordCloud parameters.
-
-    Returns:
-        bool: True if plot saved successfully, False otherwise.
-
-    """
-    top_terms = content_data.top_terms
-    if not top_terms:
-        logging.warning("No top terms provided for word cloud plotting.")
-        return False
-
-    try:
-        # Ensure directory exists
-        path.parent.mkdir(parents=True, exist_ok=True)
-
-        # Default WordCloud parameters with option to override
-        default_params: dict[str, Any] = {
-            "width": 800,
-            "height": 400,
-            "background_color": "white",
-            "max_words": 50,
-        }
-        if wordcloud_params:
-            default_params.update(wordcloud_params)
-
-        # Validate top_terms are strings
-        if not all(isinstance(term, str) for term in top_terms):
-            error_message = "All top_terms must be strings."
-            raise ValueError(error_message)
-
-        # Generate word cloud
-        wordcloud = WordCloud(**default_params).generate(" ".join(top_terms))
-
-        # Plot with style context
-        with plt.style.context(style):
-            fig = plt.figure(figsize=(10, 5))
-            plt.imshow(wordcloud, interpolation="bilinear")
-            plt.axis("off")
-            plt.title("Word Cloud of Top Terms", pad=10)  # Add padding to avoid overlap
-            fig.savefig(path, dpi=dpi, bbox_inches="tight")
-            plt.close(fig)
-
-        logging.info("Word cloud plot saved to %s", path)
-
-    except OSError:
-        logging.exception("Failed to save word cloud to %s", path)
-        return False
-    except ValueError:
-        logging.exception("Invalid data for word cloud")
-        return False
-    except Exception:
-        logging.exception("Error generating word cloud: %s")
-        return False
-    else:
-        return True
 
 
 async def main(account: str, config: ConfigModel, log_level: str = "INFO") -> int:
